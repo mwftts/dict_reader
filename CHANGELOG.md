@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
-## [1.6.0](https://github.com/mumu-lhl/dict_reader/compare/v1.5.1..v1.6.0) - 2025-08-04
+## [1.6.0](https://github.com/mumu-lhl/dict_reader/compare/v1.5.1..v1.6.0) - 2026-01-24
 
 ### Features
 
