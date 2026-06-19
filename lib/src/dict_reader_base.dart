@@ -525,7 +525,17 @@ class DictReader {
     } else if (compressionMethod == 2) {
       decompressedBlock = zlib.decode(data);
     } else {
-      throw "Compression method not supported";
+      // Surface enough detail to diagnose: the raw method nibble, the full
+      // 4-byte info word, and the first 8 bytes of the block. If a real
+      // file fails here, the bytes usually reveal whether it is LZO (1),
+      // an unknown method, or — most often — that an earlier read drifted
+      // out of alignment and these aren't a block header at all.
+      final head = block.sublist(0, block.length < 8 ? block.length : 8);
+      final headHex =
+          head.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+      throw "Compression method $compressionMethod not supported "
+          "(info=0x${info.toRadixString(16).padLeft(8, '0')}, "
+          "blockSize=${block.length}, head=[$headHex])";
     }
 
     return decompressedBlock;
