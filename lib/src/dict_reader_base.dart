@@ -522,14 +522,18 @@ class DictReader {
 
     if (compressionMethod == 0) {
       decompressedBlock = data;
+    } else if (compressionMethod == 1) {
+      // LZO (lzo1x). The decompressed size is not threaded through here, so
+      // the decoder grows its output buffer on demand.
+      decompressedBlock = _lzo1xDecompress(data);
     } else if (compressionMethod == 2) {
       decompressedBlock = zlib.decode(data);
     } else {
       // Surface enough detail to diagnose: the raw method nibble, the full
-      // 4-byte info word, and the first 8 bytes of the block. If a real
-      // file fails here, the bytes usually reveal whether it is LZO (1),
-      // an unknown method, or — most often — that an earlier read drifted
-      // out of alignment and these aren't a block header at all.
+      // 4-byte info word, and the first 8 bytes of the block. Methods 0 (none),
+      // 1 (LZO) and 2 (zlib) are the only ones the MDX/MDD format defines, so
+      // anything else usually means an earlier read drifted out of alignment
+      // and these aren't a block header at all.
       final head = block.sublist(0, block.length < 8 ? block.length : 8);
       final headHex =
           head.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
@@ -1101,4 +1105,224 @@ Future<_DictInitData> _initDictIsolate(
 
   await reader.close();
   return initData;
+}
+
+// The control flow of `lzo1x_decompress` is a `goto`-based state machine.
+// Dart has no `goto`, so the labels are modelled as enum states driven by a
+// single dispatch loop. The names mirror the canonical C labels.
+enum _LzoState {
+  topLoop,
+  firstLiteralRun,
+  match,
+  copyMatch,
+  matchDone,
+  matchNext,
+  done,
+}
+
+/// Decompresses an LZO1X compressed [input] (compression method `1`).
+///
+/// MDX/MDD record and key blocks may be LZO compressed. This is a clean-room
+/// implementation of the `lzo1x_decompress` algorithm written from the
+/// published LZO bitstream format, so it carries no GPL obligations and is
+/// safe to ship under this package's MIT license.
+///
+/// [input] must be the raw LZO bitstream (without any wrapper header such as
+/// the one python-lzo prepends). If the decompressed size is known (from the
+/// MDX/MDD block info) pass it as [outLength] so the buffer can be
+/// preallocated exactly; otherwise it grows on demand.
+///
+/// Throws a [FormatException] if the stream is malformed, or if [outLength] is
+/// given and the produced output does not match it.
+Uint8List _lzo1xDecompress(List<int> input, [int? outLength]) {
+  final src = input is Uint8List ? input : Uint8List.fromList(input);
+
+  final bool fixed = outLength != null;
+  var out = Uint8List(fixed ? outLength : (src.length * 3 + 64));
+
+  final int ipEnd = src.length;
+  int ip = 0;
+  int op = 0;
+  int t = 0;
+  int mPos = 0;
+
+  // Ensures [out] can hold at least [needed] more bytes beyond [op].
+  void ensure(int needed) {
+    final required = op + needed;
+    if (required <= out.length) {
+      return;
+    }
+    if (fixed) {
+      throw const FormatException("LZO: output overrun");
+    }
+    var newLen = out.length * 2;
+    while (newLen < required) {
+      newLen *= 2;
+    }
+    final grown = Uint8List(newLen);
+    grown.setRange(0, op, out);
+    out = grown;
+  }
+
+  // Reads a single byte from the input stream with a bounds check.
+  int readByte() {
+    if (ip >= ipEnd) {
+      throw const FormatException("LZO: input overrun");
+    }
+    return src[ip++];
+  }
+
+  // Accumulates a length encoded as a run of zero bytes (each worth 255)
+  // terminated by a non-zero byte. [base] is the constant added afterwards.
+  int readLongLength(int base) {
+    var length = 0;
+    while (src[ip] == 0) {
+      length += 255;
+      if (++ip >= ipEnd) {
+        throw const FormatException("LZO: input overrun reading length");
+      }
+    }
+    length += base + readByte();
+    return length;
+  }
+
+  // Copies [count] literal bytes straight from input to output.
+  void copyLiterals(int count) {
+    if (ip + count > ipEnd) {
+      throw const FormatException("LZO: input overrun copying literals");
+    }
+    ensure(count);
+    for (var k = 0; k < count; k++) {
+      out[op++] = src[ip++];
+    }
+  }
+
+  // Copies [count] bytes from an earlier output position [from]. Done one byte
+  // at a time because source and destination windows may overlap.
+  void copyMatchBytes(int from, int count) {
+    if (from < 0) {
+      throw const FormatException("LZO: lookbehind overrun");
+    }
+    ensure(count);
+    var m = from;
+    for (var k = 0; k < count; k++) {
+      out[op++] = out[m++];
+    }
+  }
+
+  // M2 encoding window size, used by the short-match instructions.
+  const int m2MaxOffset = 0x0800;
+
+  // Initial state: a leading byte > 17 is a run of literals encoded inline.
+  var state = _LzoState.topLoop;
+  if (src.isNotEmpty && src[ip] > 17) {
+    t = readByte() - 17;
+    if (t < 4) {
+      state = _LzoState.matchNext;
+    } else {
+      copyLiterals(t);
+      state = _LzoState.firstLiteralRun;
+    }
+  }
+
+  loop:
+  while (true) {
+    switch (state) {
+      case _LzoState.topLoop:
+        t = readByte();
+        if (t >= 16) {
+          state = _LzoState.match;
+          continue loop;
+        }
+        // Literal run.
+        if (t == 0) {
+          t = readLongLength(15);
+        }
+        copyLiterals(t + 3);
+        state = _LzoState.firstLiteralRun;
+        continue loop;
+
+      case _LzoState.firstLiteralRun:
+        t = readByte();
+        if (t >= 16) {
+          state = _LzoState.match;
+          continue loop;
+        }
+        // M1 case: 3 bytes copied from a near distance.
+        mPos = op - 1 - m2MaxOffset - (t >> 2) - (readByte() << 2);
+        copyMatchBytes(mPos, 3);
+        state = _LzoState.matchDone;
+        continue loop;
+
+      case _LzoState.match:
+        if (t >= 64) {
+          mPos = op - 1 - ((t >> 2) & 7) - (readByte() << 3);
+          t = (t >> 5) - 1;
+        } else if (t >= 32) {
+          t &= 31;
+          if (t == 0) {
+            t = readLongLength(31);
+          }
+          final d = src[ip] + (src[ip + 1] << 8);
+          ip += 2;
+          mPos = op - 1 - (d >> 2);
+        } else if (t >= 16) {
+          mPos = op - ((t & 8) << 11);
+          t &= 7;
+          if (t == 0) {
+            t = readLongLength(7);
+          }
+          final d = src[ip] + (src[ip + 1] << 8);
+          ip += 2;
+          mPos -= (d >> 2);
+          if (mPos == op) {
+            // End-of-stream marker.
+            state = _LzoState.done;
+            continue loop;
+          }
+          mPos -= 0x4000;
+        } else {
+          // t < 16: 2 bytes from a very near distance.
+          mPos = op - 1 - (t >> 2) - (readByte() << 2);
+          copyMatchBytes(mPos, 2);
+          state = _LzoState.matchDone;
+          continue loop;
+        }
+        state = _LzoState.copyMatch;
+        continue loop;
+
+      case _LzoState.copyMatch:
+        // [t] holds (match length - 2).
+        copyMatchBytes(mPos, t + 2);
+        state = _LzoState.matchDone;
+        continue loop;
+
+      case _LzoState.matchDone:
+        // The low two bits of the previous instruction's last byte give the
+        // number of trailing literals (0..3).
+        t = src[ip - 2] & 3;
+        if (t == 0) {
+          state = _LzoState.topLoop;
+          continue loop;
+        }
+        state = _LzoState.matchNext;
+        continue loop;
+
+      case _LzoState.matchNext:
+        copyLiterals(t);
+        t = readByte();
+        state = _LzoState.match;
+        continue loop;
+
+      case _LzoState.done:
+        break loop;
+    }
+  }
+
+  if (fixed && op != outLength) {
+    throw FormatException(
+        "LZO: decompressed size mismatch (expected $outLength, got $op)");
+  }
+
+  return op == out.length ? out : Uint8List.sublistView(out, 0, op);
 }
